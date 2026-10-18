@@ -28,7 +28,7 @@ Every intermediate file is in the work folder (default: "<game file folder>/TOTK
 what is already done and correct. Mac saves, shader cache and logs go to the user's Library folders; iOS keeps saves
 and the writable shader cache in the app's Documents container.
 
-Needs for Mac: macOS 26 or later on Apple silicon, the Xcode command line tools, Homebrew with
+Needs for Mac: macOS 26 or later on Apple silicon (or macOS 15 with TOTK_M3=1: the Metal 3 build, Tears of the Kingdom only), the Xcode command line tools, Homebrew with
     brew install opus libvpx python@3.14
 For iPhone/iPad: Xcode 26+ with iOS/Metal toolchains, plus xcodegen, CMake and Ninja.
 Optional: Xcode's Metal toolchain (xcodebuild -downloadComponent MetalToolchain) compiles the startup shaders into the
@@ -218,12 +218,20 @@ def _bfttf_valid(path):
 
 
 # ---- prerequisites ----
+def metal3():
+    """TOTK_M3=1: build the macOS 15 / Metal 3 variant (no frame interpolation or temporal anti-aliasing)."""
+    return os.environ.get('TOTK_M3', '') not in ('', '0')
+
+
 def prerequisites(args):
     if platform.system() != 'Darwin' or platform.machine() != 'arm64':
         raise BuildError('needs a Mac with Apple silicon')
     major = int(platform.mac_ver()[0].split('.')[0] or 0)
-    if major < 26:
-        raise BuildError(f'needs macOS 26 or later (Metal 4); this is macOS {platform.mac_ver()[0]}')
+    # TOTK_M3=1: the Metal 3 build (games/totk/Makefile, DM_NVN_M3) needs macOS 15; the default Metal 4 build needs macOS 26
+    need = 15 if metal3() else 26
+    if major < need:
+        raise BuildError(f'needs macOS {need} or later ({"Metal 3" if metal3() else "Metal 4"}); this is macOS {platform.mac_ver()[0]}'
+                         + ('' if metal3() else '. On macOS 15, TOTK_M3=1 builds the Metal 3 version'))
     if subprocess.run(['xcrun', '--find', 'clang'], capture_output=True).returncode:
         raise BuildError('the Xcode command line tools are missing: xcode-select --install')
     # SPIRV-Cross is C++: without the SDK's libc++ headers the build stops much later at "'string' file not found" (#41)
@@ -761,10 +769,18 @@ def step_shader_libs(tree, logs, *, version='v0'):
 
 def step_binary(tree, game, keys, env, logs, *, version="v0", title='0100f2c0115b6000'):
     say('4/4 app: building the game binary and the launcher')
-    run(['make', f'-j{os.cpu_count() or 4}', 'runtime' if version == 'v0' else f'runtime-{version}'], logs / 'runtime.log', cwd=tree, env=env)
+    target = 'runtime' if version == 'v0' else f'runtime-{version}'
+    m3 = metal3()
+    if m3:
+        if version.startswith('botw'):
+            raise BuildError('TOTK_M3=1 (the Metal 3 build) covers Tears of the Kingdom only')
+        target += '-m3'
+        say('   Metal 3 build: minimum macOS 15; frame interpolation (key 2) and edge smoothing (key 5) need macOS 26 and stay off')
+    run(['make', f'-j{os.cpu_count() or 4}', target], logs / 'runtime.log', cwd=tree, env=env)
     # the launcher is per game and version (runtime/game_version.h: the data folder, the log name, the backup of saves)
     defines = [] if version == 'v0' else [f'-DGAME_{version.upper()}=1'] if version.startswith('botw') else [f'-DTOTK_GAME_{version.upper()}=1']
-    run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Ithird_party/d2r_gfx/gfx/nvn', '-Iruntime', *defines, 'app/launcher.m', '-framework', 'AppKit',
+    run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Ithird_party/d2r_gfx/gfx/nvn', '-Iruntime', *defines,
+         *(['-mmacosx-version-min=15.0'] if m3 else []), 'app/launcher.m', '-framework', 'AppKit',
          '-o', 'build/app-launcher'], logs / 'launcher.log', cwd=tree, env=env)
     # used only while packaging (step_warm_metal); not part of the app
     run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Wextra', 'tools/warm_metal_cache.m', '-framework', 'Metal',
@@ -883,7 +899,8 @@ def step_app(tree, out, logs, *, version="v0", game='totk'):
     if tmp.exists():
         remove_tree(tmp)
     res = tmp / 'Contents/Resources/totk'   # the launcher's game folder, for both games (app/launcher.m)
-    clone(tree / ('build/totk-native' if version == 'v0' else f'build/totk-native-{version}'), res/'build/totk-native')
+    binary = 'build/totk-native' if version == 'v0' else f'build/totk-native-{version}'
+    clone(tree / (binary + ('-m3' if metal3() else '')), res/'build/totk-native')
     files = ['build/spirv-cross/spirv-cross', f'rewritten/{version}/main.patched.bin', f'rewritten/{version}/sdk.patched.bin',
              f'rewritten/{version}/subsdk0.patched.bin', f'extracted/{version}/romfs/runtime-index.bin']   # romfs.bin: data_bundle
     files += ['build/pso_manifest.tsv', 'build/pso_title.tsv']   # exported from the game's shared shader list (games/totk/Makefile)
@@ -919,7 +936,7 @@ def step_app(tree, out, logs, *, version="v0", game='totk'):
     clone(tree / 'build/app-launcher', tmp / f'Contents/MacOS/{executable}')
     info = dict(CFBundleDevelopmentRegion='en', CFBundleExecutable=executable, CFBundleIdentifier=bundle_id, CFBundleName=app_name,
                 CFBundleDisplayName=app_name, CFBundlePackageType='APPL', CFBundleShortVersionString=expected['display_version'],
-                CFBundleVersion=str(expected['version'] + 1), LSMinimumSystemVersion='26.0', NSHighResolutionCapable=True,
+                CFBundleVersion=str(expected['version'] + 1), LSMinimumSystemVersion='15.0' if metal3() else '26.0', NSHighResolutionCapable=True,
                 LSApplicationCategoryType='public.app-category.action-games', LSSupportsGameMode=True,
                 GCSupportsControllerUserInteraction=True)
     icon = tree / 'build/AppIcon.icns'

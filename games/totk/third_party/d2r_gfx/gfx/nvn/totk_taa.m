@@ -16,6 +16,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if DM_NVN_M3
+/* macOS 15 / Metal 3: the anti-aliasing above is built on the Metal 4 MetalFX scaler (MTL4FXTemporalScaler, compiled with an
+   MTL4Compiler and fed through argument tables), which does not exist before macOS 26. Key 5 stays off here; it is off by
+   default on Metal 4 too, so the default picture and frame rate are the same. */
+#import "m3_compat.h"
+#include "totk_taa.h"
+int taa_enabled(void) { return 0; }
+int taa_active(void) { return 0; }
+int taa_ready(void) { return 0; }
+void taa_toggle(void) { static int told; if (!told++) fprintf(stderr, "[dm] [nvn-mtl] [taa] key 5: temporal anti-aliasing needs macOS 26 (Metal 4); not available in the macOS 15 build\n"); }
+int taa_pass(MTL4RenderPassDescriptor *pd) { (void)pd; return 0; }
+int taa_jittered(void) { return 0; }
+void taa_jitter(double *x, double *y) { *x = 0; *y = 0; }
+void taa_note_camera(const float *cam, int n) { (void)cam; (void)n; }
+id<MTLTexture> taa_encode(id<MTL4CommandBuffer> cb, id<MTLTexture> scene) { (void)cb; (void)scene; return nil; }
+id<MTLResidencySet> taa_residency(void) { return nil; }
+void taa_frame_end(void) {}
+void taa_stats(char *out, size_t n) { snprintf(out, n, "not available on macOS 15 (needs Metal 4)"); }
+#else
 #include "totk_taa.h"
 
 #define TLOG(...) do { fprintf(stderr, "[dm] [nvn-mtl] [taa] " __VA_ARGS__); fputc('\n', stderr); } while (0)
@@ -236,3 +255,4 @@ void taa_stats(char *out, size_t n) {
     snprintf(out, n, "frame %llu: anti-aliased %llu, history resets %llu, without depth or camera %llu",
              (unsigned long long)g.frame, (unsigned long long)g.done, (unsigned long long)g.resets, (unsigned long long)g.missing);
 }
+#endif   // DM_NVN_M3
