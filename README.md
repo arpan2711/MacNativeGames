@@ -1,5 +1,61 @@
 # MacNativeGames
 
+> ## This fork: Tears of the Kingdom on macOS 15, with 8BitDo controllers
+>
+> The upstream project needs **macOS 26**: its renderer is written against Metal 4. This fork builds and runs **Tears of the
+> Kingdom on macOS 15** with a Metal 3 backend, reads **8BitDo controllers that macOS's GameController framework ignores**,
+> and adds an **on-screen button guide**. Branch `m3-on-main`, based on upstream `main` of 20 October 2026.
+>
+> **Tested so far** (one Mac: MacBook Air, Apple M4, 16 GB, macOS 15.5; TotK **1.0.0** from a cartridge dump):
+> - The build completes. All 22,643 startup shaders compile and are found in Metal's cache.
+> - The game plays: title, intro movie, gameplay. In a 12-minute uncapped session: GPU about 87%, CPU about 1.5 cores, game memory about 1.8 GB
+>   (plus 2.7 GB GPU memory), no thermal throttling, about 16–21 W on battery.
+> - An **8BitDo Ultimate 2C Wireless** over Bluetooth: every button and both sticks, checked live and in game.
+> - The button guide (key 6) in game.
+>
+> **Not tested yet:** the 1.1.2 / 1.2.1 / 1.4.3 updates on this backend, other Macs, long sessions, Breath of the Wild (the
+> Metal 3 build covers TotK only). Reports welcome.
+>
+> ### Build (macOS 15)
+> Same as upstream (see below), with `TOTK_M3=1`:
+> ```bash
+> brew install opus libvpx python@3.14
+> TOTK_M3=1 python3.14 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys -o ~/Games/"Tears of the Kingdom.app"
+> ```
+> On macOS 15 the shader step takes about 12 minutes instead of about 2: macOS 15 runs only two Metal compiler processes for
+> one program.
+>
+> ### What changed
+> - **Metal 3 backend.** This is the Metal 4 → Metal 3 compatibility layer by **Meson ([1918662410-ship-it](https://github.com/1918662410-ship-it/MacNativeGames))**,
+>   from upstream PR [#6](https://github.com/ly05010419/MacNativeGames/pull/6), which upstream declined because its
+>   maintainer cannot test macOS 15. It is ported here onto current upstream (232 commits newer), taking only the graphics
+>   backend. Changes from the original PR:
+>   - the buffer lookup is a sorted, growable table with binary search, instead of a fixed 1024-entry table that silently
+>     dropped later buffers;
+>   - `totk_taa.m`, which upstream added later, gets a Metal 3 stand-in.
+>
+>   MetalFX **frame interpolation (key 2)** and **temporal anti-aliasing (key 5)** need macOS 26 and are off. Both are off by
+>   default upstream too. MetalFX upscaling (key 3) works.
+> - **8BitDo controllers through raw HID.** macOS sees an 8BitDo Ultimate 2C over Bluetooth LE as a plain HID gamepad that
+>   `GCController` never lists. `runtime/gamepad.m` now also reads 8BitDo's DirectInput report layout (measured on the
+>   controller) into the same input path, so `controls.txt`, tap/toggle/aim modes and face buttons by position all work.
+>   Rumble and motion need GameController and are not available this way. `TOTK_HID_GAMEPADS=0` turns this path off.
+> - **Button guide (key 6).** A controller drawing in the top-right corner. Each button shows its printed label (Xbox/8BitDo
+>   letters, PlayStation symbols or Nintendo letters, matching the connected controller) and what it does in the game, from
+>   the current layout. `TOTK_PAD_GUIDE=0` starts with it hidden.
+>
+> ### Battery tips (laptops)
+> The game runs uncapped at up to 120 fps by default. On a 60 Hz screen, frames above 60 are never shown and only cost
+> power. Start the app with a cap:
+> ```bash
+> open --env TOTK_UNCAPPED_HZ=60 "Tears of the Kingdom.app"                                   # no visible difference at 60 Hz
+> open --env TOTK_UNCAPPED_HZ=30 --env TOTK_RENDER_RES=1440x810 "Tears of the Kingdom.app"    # balanced
+> ```
+>
+> Same legal terms as upstream: bring your own game and keys, and never share the app you build.
+>
+> ---
+
 # English
 
 **Breath of the Wild 1.6.0 is now officially supported on Mac!** (Mac only for now: no iPhone or iPad build yet.)
