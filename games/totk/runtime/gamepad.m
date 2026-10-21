@@ -1,6 +1,10 @@
 /* Native macOS controllers feed the same FullKey state as the keyboard. */
 #import <Foundation/Foundation.h>
 #import <GameController/GameController.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_OSX
+#import <IOKit/hid/IOHIDManager.h>
+#endif
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -76,6 +80,119 @@ static uint64_t gamepad_buttons(GCExtendedGamepad *pad, int by_position) {
     return buttons;
 }
 
+#if TARGET_OS_OSX
+/* Raw HID gamepads that GameController does not take (TOTK_HID_GAMEPADS=0 turns this off). An 8BitDo Ultimate 2C Wireless
+   over Bluetooth LE (2dc8:301b) is a plain HID gamepad that GCController never lists, so it would be ignored. Only
+   controllers with a known report layout are read: a wrong layout would press the wrong buttons. 8BitDo's DirectInput
+   layout (measured on the Ultimate 2C): buttons 1 A, 2 B, 4 X, 5 Y (Xbox positions: A bottom, B right, X left, Y top),
+   7 LB, 8 RB, 9 LT, 10 RT, 11 Select, 12 Start, 13 Home, 14 L3, 15 R3; hat 0 = up, clockwise, 8+ = centred; sticks X/Y and
+   Z/Rz, 0..255, down positive. Read on the main queue, like GameController's handlers. */
+enum { HID_PADS = 4, HID_BUTTONS = 16 };
+static struct hid_pad {
+    IOHIDDeviceRef device;
+    char name[128];
+    uint8_t button[HID_BUTTONS + 1];
+    int hat;
+    float lx, ly, rx, ry;   // -1..1, up positive
+} hidPads[HID_PADS];
+static IOHIDManagerRef hidManager;
+
+static int hid_layout_known(IOHIDDeviceRef device) {
+    CFTypeRef vendor = IOHIDDeviceGetProperty(device, CFSTR(kIOHIDVendorIDKey));
+    int vid = 0; if (vendor) CFNumberGetValue(vendor, kCFNumberIntType, &vid);
+    return vid == 0x2dc8;   // 8BitDo
+}
+
+/* GameController takes this controller itself (a later firmware or mode may make it an MFi or Xbox controller). */
+static int hid_taken_by_gamecontroller(const struct hid_pad *pad) {
+    for (GCController *controller in GCController.controllers)
+        if (controller.extendedGamepad && controller.vendorName && !strcmp(controller.vendorName.UTF8String, pad->name)) return 1;
+    return 0;
+}
+
+static float hid_axis(IOHIDElementRef element, long value) {
+    long lo = IOHIDElementGetLogicalMin(element), hi = IOHIDElementGetLogicalMax(element);
+    if (hi <= lo) return 0;
+    float v = (float)(value - lo) / (float)(hi - lo) * 2.0f - 1.0f;
+    return v < -1 ? -1 : v > 1 ? 1 : v;
+}
+
+static struct hid_pad *hid_slot(IOHIDDeviceRef device) {
+    for (int i = 0; i < HID_PADS; i++) if (hidPads[i].device == device) return &hidPads[i];
+    return NULL;
+}
+
+static void hid_value(void *context, IOReturn result, void *sender, IOHIDValueRef value) {
+    (void)context; (void)result; (void)sender;
+    IOHIDElementRef element = IOHIDValueGetElement(value);
+    struct hid_pad *pad = hid_slot(IOHIDElementGetDevice(element));
+    if (!pad) return;
+    uint32_t page = IOHIDElementGetUsagePage(element), usage = IOHIDElementGetUsage(element);
+    long v = IOHIDValueGetIntegerValue(value);
+    if (page == kHIDPage_Button) { if (usage >= 1 && usage <= HID_BUTTONS) pad->button[usage] = v != 0; else return; }
+    else if (page == kHIDPage_GenericDesktop && usage == kHIDUsage_GD_Hatswitch) pad->hat = (int)(v - IOHIDElementGetLogicalMin(element));
+    else if (page == kHIDPage_GenericDesktop && usage == kHIDUsage_GD_X) pad->lx = hid_axis(element, v);
+    else if (page == kHIDPage_GenericDesktop && usage == kHIDUsage_GD_Y) pad->ly = -hid_axis(element, v);
+    else if (page == kHIDPage_GenericDesktop && usage == kHIDUsage_GD_Z) pad->rx = hid_axis(element, v);
+    else if (page == kHIDPage_GenericDesktop && usage == kHIDUsage_GD_Rz) pad->ry = -hid_axis(element, v);
+    else return;   // battery, analog trigger depth (the trigger buttons already report the press)
+    refresh_gamepads();
+}
+
+static void hid_attach(void *context, IOReturn result, void *sender, IOHIDDeviceRef device) {
+    (void)context; (void)result; (void)sender;
+    if (!hid_layout_known(device) || hid_slot(device)) return;
+    struct hid_pad *pad = hid_slot(NULL);
+    if (!pad) return;
+    *pad = (struct hid_pad){.device = device, .hat = 8};
+    CFTypeRef product = IOHIDDeviceGetProperty(device, CFSTR(kIOHIDProductKey));
+    if (!product || !CFStringGetCString(product, pad->name, sizeof pad->name, kCFStringEncodingUTF8)) snprintf(pad->name, sizeof pad->name, "HID gamepad");
+    fprintf(stderr, "[totk-input] HID gamepad connected: %s (8BitDo DirectInput layout)%s\n", pad->name,
+            hid_taken_by_gamecontroller(pad) ? ", read through GameController instead" : "");
+    refresh_gamepads();
+}
+
+static void hid_detach(void *context, IOReturn result, void *sender, IOHIDDeviceRef device) {
+    (void)context; (void)result; (void)sender;
+    struct hid_pad *pad = hid_slot(device);
+    if (!pad) return;
+    fprintf(stderr, "[totk-input] HID gamepad disconnected: %s\n", pad->name);
+    *pad = (struct hid_pad){0};
+    refresh_gamepads();
+}
+
+static void hid_start(void) {
+    const char *e = getenv("TOTK_HID_GAMEPADS");
+    if (e && !strcmp(e, "0")) return;
+    hidManager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
+    NSArray *matching = @[@{@kIOHIDDeviceUsagePageKey: @(kHIDPage_GenericDesktop), @kIOHIDDeviceUsageKey: @(kHIDUsage_GD_GamePad)},
+                          @{@kIOHIDDeviceUsagePageKey: @(kHIDPage_GenericDesktop), @kIOHIDDeviceUsageKey: @(kHIDUsage_GD_Joystick)}];
+    IOHIDManagerSetDeviceMatchingMultiple(hidManager, (__bridge CFArrayRef)matching);
+    IOHIDManagerRegisterDeviceMatchingCallback(hidManager, hid_attach, NULL);
+    IOHIDManagerRegisterDeviceRemovalCallback(hidManager, hid_detach, NULL);
+    IOHIDManagerRegisterInputValueCallback(hidManager, hid_value, NULL);
+    IOHIDManagerSetDispatchQueue(hidManager, dispatch_get_main_queue());
+    IOReturn r = IOHIDManagerOpen(hidManager, kIOHIDOptionsTypeNone);   // before Activate: IOKit traps on callbacks set up after it
+    if (r != kIOReturnSuccess) fprintf(stderr, "[totk-input] HID gamepads unavailable (IOHIDManagerOpen 0x%x)\n", r);
+    IOHIDManagerActivate(hidManager);
+}
+
+static uint64_t hid_buttons(const struct hid_pad *pad) {
+    const uint8_t *b = pad->button;
+    uint64_t buttons = gamepad_face_positions(b[1], b[2], b[4], b[5], gamepad_face_by_position(NULL, pad->name));
+    static const struct { uint8_t hid; uint8_t bit; } rest[] = {{14, 4}, {15, 5}, {7, 6}, {8, 7}, {9, 8}, {10, 9}, {12, 10}, {11, 11}};
+    for (size_t i = 0; i < sizeof rest / sizeof *rest; i++) if (b[rest[i].hid]) buttons |= 1ULL << rest[i].bit;
+    int h = pad->hat;   // 0 up, 1 up-right, ... 7 up-left
+    if (h >= 0 && h < 8) {
+        if (h == 7 || h == 0 || h == 1) buttons |= 1ULL << 13;
+        if (h >= 1 && h <= 3) buttons |= 1ULL << 14;
+        if (h >= 3 && h <= 5) buttons |= 1ULL << 15;
+        if (h >= 5 && h <= 7) buttons |= 1ULL << 12;
+    }
+    return buttons;
+}
+#endif   // TARGET_OS_OSX
+
 static void refresh_gamepads(void) {
     RuntimeGamepadState next = {0};
     uint64_t physical = 0;
@@ -89,6 +206,18 @@ static void refresh_gamepads(void) {
         next.rx = stronger_axis(next.rx, stick_axis(pad.rightThumbstick.xAxis.value));
         next.ry = stronger_axis(next.ry, stick_axis(pad.rightThumbstick.yAxis.value));
     }
+#if TARGET_OS_OSX
+    for (int i = 0; i < HID_PADS; i++) {
+        const struct hid_pad *pad = &hidPads[i];
+        if (!pad->device || hid_taken_by_gamecontroller(pad)) continue;
+        next.connected = 1;
+        physical |= hid_buttons(pad);
+        next.lx = stronger_axis(next.lx, stick_axis(pad->lx));
+        next.ly = stronger_axis(next.ly, stick_axis(pad->ly));
+        next.rx = stronger_axis(next.rx, stick_axis(pad->rx));
+        next.ry = stronger_axis(next.ry, stick_axis(pad->ry));
+    }
+#endif
     /* Modes work on the physical buttons, not on the mapped ones: two physical buttons may share a Switch button
        (X and L3 both running), and a mapped edge would be lost while the other one is held. */
     uint64_t now = runtime_now_ns(), edges = physical & ~physicalPrev, synthetic = 0, suppressed = 0;
@@ -159,6 +288,9 @@ void runtime_gamepad_start(void) {
                    }];
     for (GCController *controller in GCController.controllers) attach_gamepad(controller);
     [GCController startWirelessControllerDiscoveryWithCompletionHandler:nil];
+#if TARGET_OS_OSX
+    hid_start();
+#endif
 }
 
 void runtime_gamepad_clear(void) {
