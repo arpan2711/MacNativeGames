@@ -293,6 +293,26 @@ void runtime_gamepad_start(void) {
 #endif
 }
 
+/* For the on-screen button guide (frontend.m, key 6): which labels the connected controller has printed on it, and the
+   Switch buttons a physical button sends with the current layout (controls.txt). Main thread. */
+int runtime_gamepad_style(void) {
+    for (GCController *controller in GCController.controllers) {
+        GCExtendedGamepad *pad = controller.extendedGamepad;
+        if (!pad) continue;
+        if ([pad isKindOfClass:GCDualSenseGamepad.class] || [pad isKindOfClass:GCDualShockGamepad.class]) return RUNTIME_PAD_PLAYSTATION;
+        if (!face_by_position(controller)) return RUNTIME_PAD_NINTENDO;
+        return RUNTIME_PAD_LETTERS;
+    }
+#if TARGET_OS_OSX
+    for (int i = 0; i < HID_PADS; i++) if (hidPads[i].device) return RUNTIME_PAD_LETTERS;   // 8BitDo: Xbox letters
+#endif
+    return RUNTIME_PAD_NONE;
+}
+uint16_t runtime_gamepad_target(int physical) {
+    if (!started || physical < 0 || physical >= CONTROLLER_BUTTONS) return 0;
+    return controllerMap[physical];
+}
+
 void runtime_gamepad_clear(void) {
     runtime_feedback_quiet();
     physicalPrev = 0;

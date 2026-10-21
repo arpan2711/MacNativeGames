@@ -126,6 +126,11 @@ void runtime_gamepad_read(RuntimeGamepadState *out);
 /* Forget held buttons and sticks: macOS stops delivering controller events (including releases) while the app is in
    the background, so a button held at focus loss would otherwise stay pressed for the game. */
 void runtime_gamepad_clear(void);
+/* On-screen button guide (frontend.m, key 6): the connected controller's printed labels, and the Switch buttons
+   (controller_map.h bits) a physical button (controller_physical_names index) sends with the current layout. */
+enum { RUNTIME_PAD_NONE = 0, RUNTIME_PAD_LETTERS = 1, RUNTIME_PAD_PLAYSTATION = 2, RUNTIME_PAD_NINTENDO = 3 };
+int runtime_gamepad_style(void);
+uint16_t runtime_gamepad_target(int physical);
 void runtime_touch_pad_set(const RuntimeGamepadState *state);   /* on-screen touch controls (iOS) */
 /* Controller rumble and motion (opt-in TOTK_RUMBLE=1 / TOTK_GYRO=1): the game's hid side in runtime/hid_feedback.c, the
    Mac controller's haptics and motion sensors in runtime/gamepad_feedback.m. */

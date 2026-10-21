@@ -194,6 +194,96 @@ static void front_menubar_fps(void){   // starts the refresh once the window exi
   if(fpsMenu&&![fpsMenu.title isEqualToString:title]){fpsMenu.title=title;fpsMenuItem.title=title;}
   front_title_fps(title);}];
 }
+/* Button guide (key 6; TOTK_PAD_GUIDE=0 starts it hidden): a controller drawing in the top-right corner, under the HUD box,
+   with each button's printed label (Xbox / 8BitDo letters, PlayStation symbols or Nintendo letters, as connected) and what
+   it does in the game with the current layout (runtime_gamepad_target follows controls.txt). Shown while a controller is
+   connected; drawn by AppKit, so it costs the game's GPU nothing. */
+@interface TOTKPadGuide:NSView
+@property(strong) NSTimer *timer;
+@property int style;
+@property(copy) NSArray<NSString *> *actions;
+-(void)position;
+@end
+static NSView *padGuide;static _Atomic int padGuideOn=-1;
+enum{PG_SOUTH,PG_EAST,PG_WEST,PG_NORTH,PG_L3,PG_R3,PG_L1,PG_R1,PG_L2,PG_R2,PG_MENU,PG_VIEW,PG_LEFT,PG_UP,PG_RIGHT,PG_DOWN,PG_BUTTONS};
+static const CGFloat PG_W=346,PG_H=222,PG_SCALE=1.1;
+static NSString *pg_action(int physical){
+ static const char *const what[16]={"Action","Dash / Back","Jump","Attack","Crouch","Scope","Abilities","Throw","Lock on","Bow","Menu","Map","Shields","Items","Weapons","Whistle"};
+ uint16_t m=runtime_gamepad_target(physical);if(!m)return @"—";
+ NSMutableArray *parts=[NSMutableArray array];for(int i=0;i<16&&parts.count<2;i++)if(m&(1u<<i))[parts addObject:@(what[i])];
+ return [parts componentsJoinedByString:@" + "];
+}
+static NSString *pg_label(int style,int physical){
+ static const char *const letters[PG_BUTTONS]={"A","B","X","Y","L3","R3","LB","RB","LT","RT","Start","Select"};
+ static const char *const playstation[PG_BUTTONS]={"✕","○","□","△","L3","R3","L1","R1","L2","R2","Options","Create"};
+ static const char *const nintendo[PG_BUTTONS]={"B","A","Y","X","L3","R3","L","R","ZL","ZR","+","−"};
+ const char *const *t=style==RUNTIME_PAD_PLAYSTATION?playstation:style==RUNTIME_PAD_NINTENDO?nintendo:letters;
+ return physical<PG_LEFT&&t[physical]?@(t[physical]):@"";
+}
+static NSColor *pg_face_color(int style,int physical){
+ CGFloat c[4][3]={{0.36,0.78,0.30},{0.90,0.27,0.24},{0.24,0.50,0.95},{0.98,0.80,0.18}};   // Xbox: A green, B red, X blue, Y yellow
+ if(style==RUNTIME_PAD_PLAYSTATION){CGFloat p[4][3]={{0.45,0.62,0.98},{0.95,0.36,0.40},{0.92,0.50,0.80},{0.30,0.82,0.65}};memcpy(c,p,sizeof c);}
+ if(style==RUNTIME_PAD_NINTENDO)return [NSColor colorWithCalibratedWhite:0.82 alpha:1];
+ return [NSColor colorWithCalibratedRed:c[physical][0] green:c[physical][1] blue:c[physical][2] alpha:1];
+}
+@implementation TOTKPadGuide
+-(BOOL)isFlipped{return YES;}
+-(NSView *)hitTest:(NSPoint)p{(void)p;return nil;}
+-(instancetype)initWithFrame:(NSRect)frame{if((self=[super initWithFrame:frame])){self.wantsLayer=YES;self.layer.backgroundColor=[NSColor colorWithCalibratedWhite:0.04 alpha:0.72].CGColor;self.layer.cornerRadius=9;self.layer.borderWidth=1;self.layer.borderColor=[NSColor colorWithCalibratedWhite:1 alpha:0.14].CGColor;
+ __weak TOTKPadGuide *weak=self;self.timer=[NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t){(void)t;[weak refresh];}];[self refresh];}return self;}
+-(void)refresh{
+ if(padGuideOn<0){const char *e=getenv("TOTK_PAD_GUIDE");padGuideOn=!(e&&!strcmp(e,"0"));}
+ int style=runtime_gamepad_style();NSMutableArray *a=[NSMutableArray array];for(int i=0;i<PG_BUTTONS;i++)[a addObject:pg_action(i)];
+ BOOL hide=!padGuideOn||style==RUNTIME_PAD_NONE||(bootOverlay&&!bootOverlay.hidden);
+ if(self.hidden!=hide)self.hidden=hide;
+ if(style!=self.style||![a isEqualToArray:self.actions]){self.style=style;self.actions=a;self.needsDisplay=YES;}
+ [self position];}
+-(void)position{if(!self.superview)return;NSRect b=self.superview.bounds;CGFloat w=ceil(PG_W*PG_SCALE),h=ceil(PG_H*PG_SCALE),m=10,top=b.size.height-m;
+ if(shortcutHelp&&!shortcutHelp.hidden&&shortcutHelp.frame.size.height>0)top=NSMinY(shortcutHelp.frame)-8;   // under the HUD box
+ NSRect f=NSMakeRect(floor(b.size.width-w-m),floor(top-h),w,h);if(!NSEqualRects(f,self.frame))self.frame=f;}
+static void pg_text(NSString *s,CGFloat x,CGFloat y,int align,CGFloat size,NSColor *color,BOOL bold){   // align -1 right edge at x, 0 centred, 1 left edge at x
+ NSDictionary *at=@{NSFontAttributeName:[NSFont systemFontOfSize:size weight:bold?NSFontWeightBold:NSFontWeightMedium],NSForegroundColorAttributeName:color};
+ NSSize z=[s sizeWithAttributes:at];CGFloat ox=align<0?x-z.width:align==0?x-z.width/2:x;[s drawAtPoint:NSMakePoint(ox,y-z.height/2) withAttributes:at];}
+static void pg_tag(NSString *label,NSString *action,CGFloat x,CGFloat y,CGFloat w,int right){   // a shoulder button: [label] action
+ NSColor *dim=[NSColor colorWithCalibratedWhite:1 alpha:0.10],*line=[NSColor colorWithCalibratedWhite:1 alpha:0.28];
+ NSBezierPath *p=[NSBezierPath bezierPathWithRoundedRect:NSMakeRect(x,y-9,w,18) xRadius:9 yRadius:9];[dim setFill];[p fill];[line setStroke];[p stroke];
+ CGFloat lx=right?x+w-22:x+22;NSBezierPath *t=[NSBezierPath bezierPathWithRoundedRect:NSMakeRect(lx-17,y-7,34,14) xRadius:7 yRadius:7];[[NSColor colorWithCalibratedWhite:1 alpha:0.85] setFill];[t fill];
+ pg_text(label,lx,y,0,9,[NSColor colorWithCalibratedWhite:0.08 alpha:1],YES);
+ pg_text(action,right?x+w-44:x+44,y,right?-1:1,10,NSColor.whiteColor,NO);}
+-(void)drawRect:(NSRect)dirty{(void)dirty;
+ NSAffineTransform *s=[NSAffineTransform transform];[s scaleBy:PG_SCALE];[s concat];
+ NSArray<NSString *> *A=self.actions;int st=self.style;if(A.count<PG_BUTTONS)return;
+ NSColor *white=NSColor.whiteColor,*grey=[NSColor colorWithCalibratedWhite:0.72 alpha:1],*body=[NSColor colorWithCalibratedWhite:1 alpha:0.09],*edge=[NSColor colorWithCalibratedWhite:1 alpha:0.30];
+ pg_text(@"Controls  ·  key 6 hides",12,12,1,9.5,grey,NO);
+ pg_tag(pg_label(st,PG_L2),A[PG_L2],12,34,150,0);pg_tag(pg_label(st,PG_L1),A[PG_L1],12,56,150,0);
+ pg_tag(pg_label(st,PG_R2),A[PG_R2],184,34,150,1);pg_tag(pg_label(st,PG_R1),A[PG_R1],184,56,150,1);
+ // the body and its two grips
+ NSBezierPath *bp=[NSBezierPath bezierPathWithRoundedRect:NSMakeRect(18,76,294,112) xRadius:46 yRadius:46];
+ [bp appendBezierPathWithOvalInRect:NSMakeRect(28,138,88,78)];[bp appendBezierPathWithOvalInRect:NSMakeRect(214,138,88,78)];
+ [body setFill];[bp fill];   // one silhouette: no outline, so the grips do not draw lines across the body
+ // left stick (move, click: L3)
+ NSBezierPath *ls=[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(54,92,34,34)];[[NSColor colorWithCalibratedWhite:1 alpha:0.16] setFill];[ls fill];[edge setStroke];[ls stroke];
+ pg_text(@"Move",71,109,0,9,white,YES);pg_text([NSString stringWithFormat:@"%@: %@",pg_label(st,PG_L3),A[PG_L3]],71,136,0,9.5,grey,NO);
+ // d-pad
+ CGFloat dx=120,dy=172;NSBezierPath *dp=[NSBezierPath bezierPath];[dp appendBezierPathWithRect:NSMakeRect(dx-5,dy-15,10,30)];[dp appendBezierPathWithRect:NSMakeRect(dx-15,dy-5,30,10)];
+ [[NSColor colorWithCalibratedWhite:1 alpha:0.75] setFill];[dp fill];
+ pg_text(A[PG_UP],dx,dy-23,0,9.5,white,NO);pg_text(A[PG_DOWN],dx,dy+23,0,9.5,white,NO);pg_text(A[PG_LEFT],dx-19,dy,-1,9.5,white,NO);pg_text(A[PG_RIGHT],dx+19,dy,1,9.5,white,NO);
+ // right stick (camera, click: R3)
+ NSBezierPath *rs=[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(196,156,32,32)];[[NSColor colorWithCalibratedWhite:1 alpha:0.16] setFill];[rs fill];[edge setStroke];[rs stroke];
+ pg_text(@"Camera",212,172,0,8.5,white,YES);pg_text([NSString stringWithFormat:@"%@: %@",pg_label(st,PG_R3),A[PG_R3]],212,199,0,9.5,grey,NO);
+ // the two middle buttons
+ struct{int b;CGFloat x;}mid[2]={{PG_VIEW,146},{PG_MENU,184}};
+ for(int i=0;i<2;i++){NSBezierPath *p=[NSBezierPath bezierPathWithRoundedRect:NSMakeRect(mid[i].x-17,99,34,13) xRadius:6.5 yRadius:6.5];[[NSColor colorWithCalibratedWhite:1 alpha:0.80] setFill];[p fill];
+  pg_text(pg_label(st,mid[i].b),mid[i].x,105.5,0,7.5,[NSColor colorWithCalibratedWhite:0.08 alpha:1],YES);pg_text(A[mid[i].b],mid[i].x,121,0,9.5,white,NO);}
+ // face buttons: north, west, east, south around (264,116)
+ struct{int b;CGFloat x,y,tx,ty;int align;}face[4]={{PG_NORTH,264,96,264,82,0},{PG_WEST,244,116,233,116,-1},{PG_EAST,284,116,295,116,1},{PG_SOUTH,264,136,264,151,0}};
+ for(int i=0;i<4;i++){NSBezierPath *c=[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(face[i].x-9,face[i].y-9,18,18)];[pg_face_color(st,face[i].b) setFill];[c fill];
+  pg_text(pg_label(st,face[i].b),face[i].x,face[i].y,0,9.5,[NSColor colorWithCalibratedWhite:0.06 alpha:1],YES);
+  pg_text(A[face[i].b],face[i].tx,face[i].ty,face[i].align,10,white,NO);}
+}
+@end
+void runtime_pad_guide_toggle(void){dispatch_async(dispatch_get_main_queue(),^{if(padGuideOn<0){const char *e=getenv("TOTK_PAD_GUIDE");padGuideOn=!(e&&!strcmp(e,"0"));}
+ padGuideOn=!padGuideOn;fprintf(stderr,"[totk] key 6: button guide %s\n",padGuideOn?"on":"off");[(TOTKPadGuide *)padGuide refresh];});}
 void runtime_shortcut_help_toggle(void){int mode=fps_overlay_toggle_hints();dispatch_async(dispatch_get_main_queue(), ^{   // key 1: all -> minimal (FPS only) -> off
  shortcutHelp.hidden=mode==0||(mode==2&&!hud_compact());[(TOTKShortcutHelp *)shortcutHelp refresh];});}   // mode 0 off, 2 minimal (fps_overlay.h HUD_MODE_*)
 /* The drawable follows the window's pixel size; the present pass scales the game picture (1920x1080 docked) into it and
@@ -284,6 +374,8 @@ void runtime_front_run(void(*callback)(void)){
      overlay is hidden. Key 1 still controls its requested visibility. */
   [window.contentView addSubview:shortcutHelp positioned:NSWindowBelow relativeTo:bootOverlay];
   [(TOTKShortcutHelp *)shortcutHelp position];
+  padGuide=[[TOTKPadGuide alloc] initWithFrame:NSZeroRect];padGuide.autoresizingMask=NSViewMinXMargin|NSViewMinYMargin;
+  [window.contentView addSubview:padGuide positioned:NSWindowBelow relativeTo:bootOverlay];[(TOTKPadGuide *)padGuide position];
   /* The FPS, shader and load lines: in the corner panel above (compact HUD), or with TOTK_HUD=corners drawn into the game picture's corners by the present encoder (gfx/nvn/fps_overlay.c). */
   [window makeFirstResponder:window.contentView];[window center];front_sync_drawable();
   if(assume_focus()){[window orderFrontRegardless];}else{[window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];}   /* in front of other apps' windows, keyboard left alone */
